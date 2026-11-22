@@ -107,10 +107,76 @@ func (c *ClusterScaleUtils) RunPreScaleInTasks(ctx context.Context, cfg map[stri
 	return nodeResourceIDs, nil
 }
 
+// ScaleInResult is the outcome of the pre scale-in tasks. It separates the
+// nodes that are confirmed safe to terminate from the per-node detail of the
+// whole attempt, so callers never have to treat a candidate list as
+// termination authorisation.
+type ScaleInResult struct {
+
+	// Terminate is the confirmed set of nodes that drained successfully and
+	// passed every protection check, deduplicated by remote resource ID.
+	// These, and only these, may be terminated in the remote provider. It
+	// is nil when the partial failure policy aborted the action.
+	Terminate []NodeResourceID
+
+	// NodeResults holds one result per node that entered the pipeline, in a
+	// deterministic order that does not depend on goroutine completion.
+	NodeResults []NodeDrainResult
+}
+
 // RunPreScaleInTasksWithRemoteCheck triggers all the tasks, including node
 // identification, filtering by remote ID, and draining, required before
 // terminating the nodes in the remote provider.
+//
+// The returned list contains only nodes that drained successfully. If any
+// node fails to drain, an error is returned and no termination set is
+// produced, matching the historical behaviour of this function. Callers that
+// can act on partial success should use
+// RunPreScaleInTasksWithRemoteCheckDetailed.
 func (c *ClusterScaleUtils) RunPreScaleInTasksWithRemoteCheck(ctx context.Context, cfg map[string]string, remoteIDs []string, num int) ([]NodeResourceID, error) {
+
+	result, err := c.RunPreScaleInTasksWithRemoteCheckDetailed(ctx, cfg, remoteIDs, num)
+	if err != nil {
+		return nil, err
+	}
+
+	// Preserve the historical contract: any node that failed, timed out or
+	// was cancelled fails the whole action and nothing is returned for
+	// termination.
+	var mErr *multierror.Error
+	for _, r := range result.NodeResults {
+		if r.failed() {
+			mErr = multierror.Append(mErr, fmt.Errorf("node %s: %s", r.NomadNodeID, resultErrorString(r)))
+		}
+	}
+	if mErr != nil {
+		return nil, errHelper.FormattedMultiError(mErr)
+	}
+
+	return result.Terminate, nil
+}
+
+// resultErrorString renders a node result for error aggregation, preferring
+// the underlying error and falling back to the stable reason.
+func resultErrorString(r NodeDrainResult) string {
+	if r.Err != nil {
+		return r.Err.Error()
+	}
+	return r.Reason
+}
+
+// RunPreScaleInTasksWithRemoteCheckDetailed triggers all the tasks required
+// before terminating nodes in the remote provider and reports the outcome
+// per node.
+//
+// The pipeline is: identify eligible nodes, map them to remote provider IDs,
+// restrict them to the supplied remote ID set, refuse nodes protected by
+// allocation rules, select candidates with the configured node selector,
+// drain them, and finally re-check protection before authorising
+// termination. Only nodes reported in ScaleInResult.Terminate may be
+// terminated; failed, unknown, cancelled and protected nodes never enter
+// that set.
+func (c *ClusterScaleUtils) RunPreScaleInTasksWithRemoteCheckDetailed(ctx context.Context, cfg map[string]string, remoteIDs []string, num int) (*ScaleInResult, error) {
 
 	// Check that the ClusterNodeIDLookupFunc has been set, otherwise we cannot
 	// attempt to identify nodes and their remote resource IDs.
@@ -122,76 +188,273 @@ func (c *ClusterScaleUtils) RunPreScaleInTasksWithRemoteCheck(ctx context.Contex
 		return nil, errInvalidScaleInNum
 	}
 
+	protection, err := newAllocProtection(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	shortfall, err := scaleInShortfallPolicy(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	partialFailure, err := scaleInPartialFailurePolicy(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &ScaleInResult{}
+
 	// Find nodes in Nomad that match the node filtering criteria.
 	nodes, err := c.identifyEligibleScaleInNodes(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	// Find the remote ID for each of the Nomad nodes found.
-	nodeResourceIDs, err := c.IdentifyScaleInRemoteIDs(nodes)
-	if err != nil {
-		return nil, err
-	}
+	// Map each node to its remote provider ID. Nodes that cannot be mapped,
+	// or whose mapping conflicts, are recorded and excluded; they are never
+	// treated as empty or silently dropped.
+	mapped, mapResults := c.mapNodesToRemoteIDs(nodes)
+	result.NodeResults = append(result.NodeResults, mapResults...)
 
-	// Index nodes and remote node IDs by Nomad node ID for easier access.
+	// Index nodes by Nomad node ID for easier access.
 	nodesMap := make(map[string]*api.NodeListStub)
 	for _, n := range nodes {
 		nodesMap[n.ID] = n
 	}
-	nodesResourceIDsMap := make(map[string]NodeResourceID)
-	for _, id := range nodeResourceIDs {
-		nodesResourceIDsMap[id.NomadNodeID] = id
-	}
 
-	// Filter out nodes that are not part of the remote ID list.
-	filteredNodes := []*api.NodeListStub{}
-	for _, id := range nodeResourceIDs {
+	// Filter out nodes that are not part of the remote ID list, keeping the
+	// existing guarantee that only instances within the target provider
+	// group are considered.
+	inGroup := []NodeResourceID{}
+	for _, id := range mapped {
 		for _, remoteID := range remoteIDs {
 			if id.RemoteResourceID == remoteID {
 				c.log.Debug("node is part of the policy target", "node_id", id.NomadNodeID, "remote_id", id.RemoteResourceID)
-				filteredNodes = append(filteredNodes, nodesMap[id.NomadNodeID])
+				inGroup = append(inGroup, id)
 				break
 			}
 		}
 	}
 
+	// Refuse nodes protected by their current allocation snapshot before
+	// any drain is triggered. Nodes whose allocations cannot be read are
+	// refused too; an unreadable node is not an empty node.
+	candidates := inGroup
+	if protection.enabled {
+		candidates = nil
+		for _, id := range inGroup {
+			reason, protected := c.nodeProtectionStatus(id.NomadNodeID, protection)
+			switch {
+			case protected:
+				result.NodeResults = append(result.NodeResults, NodeDrainResult{
+					NodeResourceID: id,
+					Status:         NodeDrainStatusProtected,
+					Stage:          NodeDrainStageProtection,
+					Reason:         reason,
+				})
+				c.log.Info("node protected from scale in by allocation rules",
+					"node_id", id.NomadNodeID, "remote_id", id.RemoteResourceID, "reason", reason)
+			case reason == NodeProtectReasonAllocationsUnreadable:
+				result.NodeResults = append(result.NodeResults, NodeDrainResult{
+					NodeResourceID: id,
+					Status:         NodeDrainStatusFailed,
+					Stage:          NodeDrainStageProtection,
+					Reason:         reason,
+					Err:            fmt.Errorf("failed to read allocations for node %s", id.NomadNodeID),
+				})
+			default:
+				candidates = append(candidates, id)
+			}
+		}
+	}
+
 	// Ensure we have not filtered out all the available nodes.
-	if len(filteredNodes) == 0 {
-		return nil, fmt.Errorf("no nodes identified for scaling in action")
+	if len(candidates) == 0 {
+		return result, fmt.Errorf("no nodes identified for scaling in action")
 	}
 
 	// If the caller has requested more nodes than we have available once
-	// filtered, adjust the value. This shouldn't cause the whole scaling
-	// action to fail, but we should warn.
-	if num > len(filteredNodes) {
+	// filtered, the configured shortfall policy decides whether we scale in
+	// fewer nodes or abort. Protection is never skipped to make up the
+	// count, and the autoscaler's own node is never a candidate.
+	if num > len(candidates) {
+		if shortfall == ScaleInShortfallFail {
+			return result, fmt.Errorf("insufficient unprotected nodes for scale in: requested %d, available %d",
+				num, len(candidates))
+		}
 		c.log.Warn("can only identify portion of requested nodes for removal",
-			"requested", num, "available", len(filteredNodes))
-		num = len(filteredNodes)
+			"requested", num, "available", len(candidates))
+		num = len(candidates)
 	}
 
 	// Select which nodes to drain and terminate based on the policy's
 	// node selector strategy.
-	selectedNodes, err := c.SelectScaleInNodes(filteredNodes, cfg, num)
+	candidateStubs := make([]*api.NodeListStub, 0, len(candidates))
+	for _, id := range candidates {
+		candidateStubs = append(candidateStubs, nodesMap[id.NomadNodeID])
+	}
+	selectedNodes, err := c.SelectScaleInNodes(candidateStubs, cfg, num)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 
+	selectedMap := make(map[string]NodeResourceID, len(candidates))
+	for _, id := range candidates {
+		selectedMap[id.NomadNodeID] = id
+	}
 	selectedResourceIDs := []NodeResourceID{}
 	for _, n := range selectedNodes {
-		c.log.Debug("node selected for removal", "node_id", n.ID, "remote_id", nodesResourceIDsMap[n.ID].RemoteResourceID)
-		selectedResourceIDs = append(selectedResourceIDs, nodesResourceIDsMap[n.ID])
+		c.log.Debug("node selected for removal", "node_id", n.ID, "remote_id", selectedMap[n.ID].RemoteResourceID)
+		selectedResourceIDs = append(selectedResourceIDs, selectedMap[n.ID])
 	}
 
-	// Drain the nodes.
-	// TODO(jrasell) we should try some reconciliation here, where we identify
-	//  failed nodes and continue with nodes that drained successfully.
-	if err := c.DrainNodes(ctx, cfg, selectedResourceIDs); err != nil {
-		return nil, err
+	// Drain the nodes, collecting a per-node result.
+	drainResults, err := c.DrainNodesDetailed(ctx, cfg, selectedResourceIDs)
+	if err != nil {
+		return result, err
 	}
+
+	// Re-confirm the protection rules against a fresh allocation snapshot
+	// before authorising termination. Allocations can change between the
+	// first snapshot and the end of the drain; this narrows, but cannot
+	// eliminate, the race window between the snapshot and the remote
+	// provider termination call.
+	if protection.enabled {
+		for i := range drainResults {
+			if drainResults[i].Status != NodeDrainStatusDrained {
+				continue
+			}
+			reason, protected := c.nodeProtectionStatus(drainResults[i].NomadNodeID, protection)
+			switch {
+			case protected:
+				drainResults[i].Status = NodeDrainStatusProtected
+				drainResults[i].Stage = NodeDrainStagePreTerminate
+				drainResults[i].Reason = reason
+				c.log.Warn("node became protected after drain, refusing termination",
+					"node_id", drainResults[i].NomadNodeID, "reason", reason)
+			case reason == NodeProtectReasonAllocationsUnreadable:
+				drainResults[i].Status = NodeDrainStatusFailed
+				drainResults[i].Stage = NodeDrainStagePreTerminate
+				drainResults[i].Reason = reason
+				drainResults[i].Err = fmt.Errorf("failed to read allocations for node %s", drainResults[i].NomadNodeID)
+			}
+		}
+	}
+	result.NodeResults = append(result.NodeResults, drainResults...)
+
+	// Build the termination set from the confirmed nodes only, terminating
+	// each remote ID at most once.
+	seenRemoteIDs := make(map[string]struct{})
+	for _, r := range drainResults {
+		if !r.terminatable() {
+			continue
+		}
+		if _, ok := seenRemoteIDs[r.RemoteResourceID]; ok {
+			c.log.Warn("skipping duplicate remote ID in termination set",
+				"node_id", r.NomadNodeID, "remote_id", r.RemoteResourceID)
+			continue
+		}
+		seenRemoteIDs[r.RemoteResourceID] = struct{}{}
+		result.Terminate = append(result.Terminate, r.NodeResourceID)
+	}
+
+	// Whether partial success still terminates the confirmed subset is an
+	// explicit policy. On abort, nothing is authorised for termination.
+	failures := 0
+	for _, r := range result.NodeResults {
+		if r.failed() {
+			failures++
+		}
+	}
+	if failures > 0 && partialFailure == ScaleInPartialFailureAbort {
+		result.Terminate = nil
+		return result, fmt.Errorf("scale in aborted: %d node(s) did not complete successfully", failures)
+	}
+
 	c.log.Debug("pre scale-in tasks now complete")
+	return result, nil
+}
 
-	return selectedResourceIDs, nil
+// nodeProtectionStatus reads the node's current allocation snapshot and
+// evaluates the protection rules against it. A read failure is reported as
+// the allocations-unreadable reason rather than as an empty node.
+func (c *ClusterScaleUtils) nodeProtectionStatus(nodeID string, protection *allocProtection) (string, bool) {
+	allocs, _, err := c.client.Nodes().Allocations(nodeID, nil)
+	if err != nil {
+		c.log.Error("failed to read node allocations for protection check", "node_id", nodeID, "error", err)
+		return NodeProtectReasonAllocationsUnreadable, false
+	}
+	return protection.nodeProtectionReason(allocs)
+}
+
+// mapNodesToRemoteIDs translates each node to its remote provider ID on a
+// per-node basis. Nodes that fail translation, or whose remote ID is claimed
+// by more than one node, are returned as mapping-failed results and excluded
+// from the mapped list.
+func (c *ClusterScaleUtils) mapNodesToRemoteIDs(nodes []*api.NodeListStub) ([]NodeResourceID, []NodeDrainResult) {
+
+	var results []NodeDrainResult
+	mapped := make([]NodeResourceID, 0, len(nodes))
+
+	for _, node := range nodes {
+
+		// Read the full node object from the API which will contain the full
+		// information required to identify the remote provider ID.
+		nodeInfo, _, err := c.client.Nodes().Info(node.ID, nil)
+		if err != nil {
+			results = append(results, NodeDrainResult{
+				NodeResourceID: NodeResourceID{NomadNodeID: node.ID},
+				Status:         NodeDrainStatusMappingFailed,
+				Stage:          NodeDrainStageRemoteMapping,
+				Reason:         NodeDrainReasonNodeInfoUnreadable,
+				Err:            err,
+			})
+			continue
+		}
+
+		// Use the identification function to attempt to pull the remote
+		// provider ID information from the Node info.
+		id, err := c.ClusterNodeIDLookupFunc(nodeInfo)
+		if err != nil {
+			results = append(results, NodeDrainResult{
+				NodeResourceID: NodeResourceID{NomadNodeID: node.ID},
+				Status:         NodeDrainStatusMappingFailed,
+				Stage:          NodeDrainStageRemoteMapping,
+				Reason:         NodeDrainReasonRemoteIDLookupFailed,
+				Err:            err,
+			})
+			continue
+		}
+
+		c.log.Debug("identified remote provider ID for node", "node_id", nodeInfo.ID, "remote_id", id)
+		mapped = append(mapped, NodeResourceID{NomadNodeID: node.ID, RemoteResourceID: id})
+	}
+
+	// A remote ID claimed by more than one node is a mapping conflict: we
+	// cannot tell which node owns the instance, so every node involved is
+	// refused rather than risking terminating the wrong instance.
+	remoteIDCount := make(map[string]int, len(mapped))
+	for _, id := range mapped {
+		remoteIDCount[id.RemoteResourceID]++
+	}
+
+	out := make([]NodeResourceID, 0, len(mapped))
+	for _, id := range mapped {
+		if remoteIDCount[id.RemoteResourceID] > 1 {
+			results = append(results, NodeDrainResult{
+				NodeResourceID: id,
+				Status:         NodeDrainStatusMappingFailed,
+				Stage:          NodeDrainStageRemoteMapping,
+				Reason:         NodeDrainReasonRemoteIDConflict,
+				Err:            fmt.Errorf("remote ID %s claimed by multiple nodes", id.RemoteResourceID),
+			})
+			continue
+		}
+		out = append(out, id)
+	}
+
+	return out, results
 }
 
 func (c *ClusterScaleUtils) IdentifyScaleInNodes(cfg map[string]string, num int) ([]*api.NodeListStub, error) {

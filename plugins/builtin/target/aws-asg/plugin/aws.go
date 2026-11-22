@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials/ec2rolecreds"
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling/types"
+	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad-autoscaler/sdk"
 	"github.com/hashicorp/nomad-autoscaler/sdk/helper/scaleutils"
 	"github.com/hashicorp/nomad/api"
@@ -185,9 +186,18 @@ func (t *TargetPlugin) scaleIn(ctx context.Context, asg *types.AutoScalingGroup,
 		remoteIDs = append(remoteIDs, *inst.InstanceId)
 	}
 
-	ids, err := t.clusterUtils.RunPreScaleInTasksWithRemoteCheck(ctx, config, remoteIDs, int(num))
+	scaleInResult, err := t.clusterUtils.RunPreScaleInTasksWithRemoteCheckDetailed(ctx, config, remoteIDs, int(num))
 	if err != nil {
 		return fmt.Errorf("failed to perform pre-scale Nomad scale in tasks: %v", err)
+	}
+	logScaleInNodeResults(log, scaleInResult)
+
+	// Only nodes confirmed safe by the pre-scale tasks may be terminated;
+	// the candidate list is never used as termination authorisation.
+	ids := scaleInResult.Terminate
+	if len(ids) == 0 {
+		return sdk.NewTargetScalingNoOpError("no Nomad nodes confirmed safe to terminate in ASG %s",
+			*asg.AutoScalingGroupName)
 	}
 
 	// Create the event writer and write that the drain event has been
@@ -246,6 +256,23 @@ func (t *TargetPlugin) scaleIn(ctx context.Context, asg *types.AutoScalingGroup,
 		return failedTaskErr
 	}
 	return result.errorOrNil()
+}
+
+// logScaleInNodeResults emits a log line for every node that did not reach
+// the termination set, so operators can reconcile provider state with the
+// per-node outcome.
+func logScaleInNodeResults(log hclog.Logger, result *scaleutils.ScaleInResult) {
+	if result == nil {
+		return
+	}
+	for _, r := range result.NodeResults {
+		if r.Status == scaleutils.NodeDrainStatusDrained {
+			continue
+		}
+		log.Warn("node excluded from scale in termination",
+			"node_id", r.NomadNodeID, "remote_id", r.RemoteResourceID,
+			"stage", r.Stage, "status", r.Status, "reason", r.Reason, "error", r.Err)
+	}
 }
 
 // terminateInstancesInASG handles terminating all instances passed and returns

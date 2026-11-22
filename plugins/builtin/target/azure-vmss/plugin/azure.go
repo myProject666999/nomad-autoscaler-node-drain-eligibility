@@ -13,7 +13,9 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
+	"github.com/hashicorp/nomad-autoscaler/sdk"
 	"github.com/hashicorp/nomad-autoscaler/sdk/helper/ptr"
+	"github.com/hashicorp/nomad-autoscaler/sdk/helper/scaleutils"
 	"github.com/hashicorp/nomad/api"
 )
 
@@ -148,13 +150,24 @@ func (t *TargetPlugin) scaleIn(ctx context.Context, resourceGroup string, vmScal
 
 	// run pre-scale tasks using remoteIDs
 	log.Debug("starting pre-scale tasks for Azure ScaleSet instances", "remote_ids", remoteIDs)
-	ids, err := t.clusterUtils.RunPreScaleInTasksWithRemoteCheck(ctx, config, remoteIDs, int(num))
+	scaleInResult, err := t.clusterUtils.RunPreScaleInTasksWithRemoteCheckDetailed(ctx, config, remoteIDs, int(num))
 	if err != nil {
 		return fmt.Errorf("failed to perform pre-scale Nomad scale in tasks: %w", err)
 	}
+	for _, r := range scaleInResult.NodeResults {
+		if r.Status == scaleutils.NodeDrainStatusDrained {
+			continue
+		}
+		log.Warn("node excluded from scale in termination",
+			"node_id", r.NomadNodeID, "remote_id", r.RemoteResourceID,
+			"stage", r.Stage, "status", r.Status, "reason", r.Reason, "error", r.Err)
+	}
 
+	// Only nodes confirmed safe by the pre-scale tasks may be deleted; the
+	// candidate list is never used as deletion authorisation.
+	ids := scaleInResult.Terminate
 	if len(ids) == 0 {
-		return fmt.Errorf("no ids generated")
+		return sdk.NewTargetScalingNoOpError("no Nomad nodes confirmed safe to delete in ScaleSet %s", vmScaleSet)
 	}
 
 	// Grab the instanceIDs once as it is used multiple times throughout the

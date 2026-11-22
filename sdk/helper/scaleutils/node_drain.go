@@ -5,6 +5,7 @@ package scaleutils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -25,53 +26,228 @@ const (
 	nodeDrainedMetaValue = "nomad-autoscaler"
 )
 
+// NodeDrainStatus identifies the terminal outcome of a single node within a
+// scale in attempt. It is part of the result contract exposed to target
+// plugins and must remain stable.
+type NodeDrainStatus string
+
+const (
+	// NodeDrainStatusDrained indicates the node drain completed and all
+	// tasks on the node are dead. Only nodes with this status may enter the
+	// termination set.
+	NodeDrainStatusDrained NodeDrainStatus = "drained"
+
+	// NodeDrainStatusProtected indicates the node was refused before any
+	// drain was triggered because allocation protection rules matched.
+	NodeDrainStatusProtected NodeDrainStatus = "protected"
+
+	// NodeDrainStatusTimeout indicates the node did not reach a terminal
+	// drain state before the context deadline.
+	NodeDrainStatusTimeout NodeDrainStatus = "timeout"
+
+	// NodeDrainStatusCancelled indicates the drain was cancelled, either
+	// because the caller context was cancelled or because the context was
+	// already done before the drain for this node started.
+	NodeDrainStatusCancelled NodeDrainStatus = "cancelled"
+
+	// NodeDrainStatusFailed indicates a Nomad API or drain monitoring
+	// failure that is neither a timeout nor a cancellation.
+	NodeDrainStatusFailed NodeDrainStatus = "failed"
+
+	// NodeDrainStatusMappingFailed indicates the node could not be mapped
+	// to a remote provider ID, or the mapping conflicted with another node.
+	NodeDrainStatusMappingFailed NodeDrainStatus = "mapping_failed"
+)
+
+// NodeDrainStage identifies the phase a node reached within a scale in
+// attempt. It is part of the result contract exposed to target plugins and
+// must remain stable.
+type NodeDrainStage string
+
+const (
+	// NodeDrainStageRemoteMapping is the stage where Nomad nodes are
+	// translated to remote provider IDs.
+	NodeDrainStageRemoteMapping NodeDrainStage = "remote_mapping"
+
+	// NodeDrainStageProtection is the stage where allocation protection
+	// rules are evaluated before any drain is triggered.
+	NodeDrainStageProtection NodeDrainStage = "protection"
+
+	// NodeDrainStageDrain is the stage where the node drain is triggered
+	// and monitored.
+	NodeDrainStageDrain NodeDrainStage = "drain"
+
+	// NodeDrainStageWaitTasks is the stage where the autoscaler waits for
+	// all tasks on the node to be dead after the drain completed.
+	NodeDrainStageWaitTasks NodeDrainStage = "wait_tasks"
+
+	// NodeDrainStagePreTerminate is the stage where protection rules are
+	// re-evaluated after a successful drain, before the node is authorised
+	// for termination.
+	NodeDrainStagePreTerminate NodeDrainStage = "pre_terminate"
+)
+
+// Stable reason strings used in NodeDrainResult.Reason for drain stage
+// outcomes. Allocation protection reasons live in node_protection.go.
+const (
+	NodeDrainReasonDrained              = "drain_complete_tasks_dead"
+	NodeDrainReasonDrainAPIError        = "drain_api_error"
+	NodeDrainReasonDrainTimeout         = "drain_timeout"
+	NodeDrainReasonDrainCancelled       = "drain_cancelled"
+	NodeDrainReasonNotStarted           = "context_done_before_drain_start"
+	NodeDrainReasonNodeInfoUnreadable   = "node_info_unreadable"
+	NodeDrainReasonRemoteIDLookupFailed = "remote_id_lookup_failed"
+	NodeDrainReasonRemoteIDConflict     = "remote_id_conflict"
+)
+
+// NodeDrainResult describes the outcome of a single node within a scale in
+// attempt. Nodes that did not reach NodeDrainStatusDrained must never be
+// terminated in the remote provider.
+type NodeDrainResult struct {
+
+	// NodeResourceID identifies the Nomad node and, when mapping succeeded,
+	// its remote provider ID.
+	NodeResourceID
+
+	// Status is the terminal outcome for the node.
+	Status NodeDrainStatus
+
+	// Stage is the phase the node reached.
+	Stage NodeDrainStage
+
+	// Reason is a stable machine-readable reason string.
+	Reason string
+
+	// Err is the underlying error, if any. It is not serialized and is
+	// intended for logging.
+	Err error
+}
+
+// terminatable returns whether the node is confirmed safe to terminate in
+// the remote provider.
+func (r NodeDrainResult) terminatable() bool {
+	return r.Status == NodeDrainStatusDrained
+}
+
+// failed returns whether the node represents a failure, as opposed to an
+// intentional refusal (protected) or a success.
+func (r NodeDrainResult) failed() bool {
+	switch r.Status {
+	case NodeDrainStatusTimeout, NodeDrainStatusCancelled,
+		NodeDrainStatusFailed, NodeDrainStatusMappingFailed:
+		return true
+	default:
+		return false
+	}
+}
+
 // DrainNodes iterates the provided nodeID list and performs a drain on each
 // one. Each node drain is monitored and events logged until the context is
 // closed or all drains reach a terminal state.
+//
+// The returned error is an aggregation of the per-node errors; callers that
+// need to distinguish which nodes drained successfully should use
+// DrainNodesDetailed.
 func (c *ClusterScaleUtils) DrainNodes(ctx context.Context, cfg map[string]string, nodes []NodeResourceID) error {
+
+	results, err := c.DrainNodesDetailed(ctx, cfg, nodes)
+	if err != nil {
+		return err
+	}
+
+	var mErr *multierror.Error
+	for _, r := range results {
+		if r.Err != nil {
+			mErr = multierror.Append(mErr, r.Err)
+		}
+	}
+	return errHelper.FormattedMultiError(mErr)
+}
+
+// DrainNodesDetailed performs a drain on each of the provided nodes and
+// returns one result per node, in the same order as the input list. The
+// ordering therefore does not depend on goroutine completion order.
+//
+// Once the context is done, no new drains are started; nodes that were not
+// yet started are recorded as cancelled or timed out, and nodes already in
+// flight are recorded with their actual outcome.
+func (c *ClusterScaleUtils) DrainNodesDetailed(ctx context.Context, cfg map[string]string, nodes []NodeResourceID) ([]NodeDrainResult, error) {
 
 	drainSpec, err := drainSpec(cfg)
 	if err != nil {
-		return fmt.Errorf("failed to generate node drainspec: %v", err)
+		return nil, fmt.Errorf("failed to generate node drainspec: %v", err)
 	}
 
-	// Define a WaitGroup. This allows us to trigger each node drain in a go
-	// routine and then wait for them all to complete before exiting.
+	// Pre-populate the results so the output order matches the input order
+	// regardless of the order in which the drain routines finish.
+	results := make([]NodeDrainResult, len(nodes))
+
 	var wg sync.WaitGroup
-	wg.Add(len(nodes))
 
-	// Define an error to collect errors from each drain routine and a mutex to
-	// provide thread safety when calling multierror.Append.
-	var (
-		result     *multierror.Error
-		resultLock sync.Mutex
-	)
+	for i, node := range nodes {
 
-	for _, node := range nodes {
+		results[i].NodeResourceID = node
 
-		// Assign our node to a local variable as we are launching a go routine
-		// from within a for loop.
-		n := node
+		// Do not start new drains once the context is done. Record the
+		// refusal honestly rather than launching a routine that would exit
+		// immediately with an ambiguous outcome.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			results[i].Stage = NodeDrainStageDrain
+			results[i].Reason = NodeDrainReasonNotStarted
+			results[i].Err = ctxErr
+			results[i].Status = drainStatusForContextErr(ctxErr)
+			continue
+		}
 
-		// Launch a routine to drain the node. Append any error returned to the
-		// error.
-		go func() {
+		wg.Add(1)
 
-			// Ensure we call done on the WaitGroup to decrement the count remaining.
+		// Launch a routine to drain the node, recording the outcome in the
+		// node's own result slot.
+		go func(idx int, n NodeResourceID) {
 			defer wg.Done()
 
-			if err := c.drainNode(ctx, n.NomadNodeID, drainSpec); err != nil {
-				resultLock.Lock()
-				result = multierror.Append(result, err)
-				resultLock.Unlock()
+			stage, err := c.drainNodeWithStage(ctx, n.NomadNodeID, drainSpec)
+			if err == nil {
+				results[idx].Status = NodeDrainStatusDrained
+				results[idx].Stage = NodeDrainStageWaitTasks
+				results[idx].Reason = NodeDrainReasonDrained
+				c.log.Debug("node drain complete", "node_id", n.NomadNodeID)
+				return
 			}
-			c.log.Debug("node drain complete", "node_id", n.NomadNodeID)
-		}()
+
+			results[idx].Stage = stage
+			results[idx].Err = err
+			results[idx].Status, results[idx].Reason = classifyDrainError(err)
+			c.log.Debug("node drain finished without success",
+				"node_id", n.NomadNodeID, "stage", stage, "status", results[idx].Status, "error", err)
+		}(i, node)
 	}
 
 	wg.Wait()
 
-	return errHelper.FormattedMultiError(result)
+	return results, nil
+}
+
+// drainStatusForContextErr maps a context error to a drain status.
+func drainStatusForContextErr(err error) NodeDrainStatus {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return NodeDrainStatusTimeout
+	}
+	return NodeDrainStatusCancelled
+}
+
+// classifyDrainError maps a drain error to a stable status and reason.
+// Context deadline errors are reported as timeouts, context cancellations as
+// cancellations, and everything else as an API failure.
+func classifyDrainError(err error) (NodeDrainStatus, string) {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return NodeDrainStatusTimeout, NodeDrainReasonDrainTimeout
+	case errors.Is(err, context.Canceled):
+		return NodeDrainStatusCancelled, NodeDrainReasonDrainCancelled
+	default:
+		return NodeDrainStatusFailed, NodeDrainReasonDrainAPIError
+	}
 }
 
 // drainSpec generates the Nomad API node drain specification based on the user
@@ -125,6 +301,13 @@ func drainSpec(cfg map[string]string) (*api.DrainSpec, error) {
 // function handles monitoring the drain and reporting its terminal status to
 // the caller.
 func (c *ClusterScaleUtils) drainNode(ctx context.Context, nodeID string, spec *api.DrainSpec) error {
+	_, err := c.drainNodeWithStage(ctx, nodeID, spec)
+	return err
+}
+
+// drainNodeWithStage is drainNode, additionally reporting the stage the
+// drain reached when it failed.
+func (c *ClusterScaleUtils) drainNodeWithStage(ctx context.Context, nodeID string, spec *api.DrainSpec) (NodeDrainStage, error) {
 
 	c.log.Info("triggering drain on node", "node_id", nodeID, "deadline", spec.Deadline)
 
@@ -139,22 +322,22 @@ func (c *ClusterScaleUtils) drainNode(ctx context.Context, nodeID string, spec *
 	// Update the drain on the node.
 	resp, err := c.drainer.UpdateDrainOpts(nodeID, opts, nil)
 	if err != nil {
-		return fmt.Errorf("failed to drain node: %w", err)
+		return NodeDrainStageDrain, fmt.Errorf("failed to drain node: %w", err)
 	}
 
 	// Monitor the drain so we output the log messages. An error here indicates
 	// the drain failed to complete successfully.
 	if err := c.monitorNodeDrain(ctx, nodeID, resp.LastIndex, spec.IgnoreSystemJobs); err != nil {
-		return fmt.Errorf("context done while monitoring node drain: %w", err)
+		return NodeDrainStageDrain, fmt.Errorf("context done while monitoring node drain: %w", err)
 	}
 
 	// Drain completion is based on allocation status and does not guarantee
 	// all tasks have finished. Wait until all tasks are dead before proceeding.
 	if err := c.waitForAllTasksDead(ctx, nodeID); err != nil {
-		return fmt.Errorf("failed waiting for all tasks to be dead on node %s: %w", nodeID, err)
+		return NodeDrainStageWaitTasks, fmt.Errorf("failed waiting for all tasks to be dead on node %s: %w", nodeID, err)
 	}
 
-	return nil
+	return NodeDrainStageWaitTasks, nil
 }
 
 // waitForAllTasksDead blocks until all tasks across all allocations on the

@@ -95,6 +95,49 @@ const (
 	// within their provider.
 	TargetConfigKeyNodePurge = "node_purge"
 
+	// TargetConfigKeyNodeProtectAllocations is the config key which enables
+	// allocation based protection of nodes during horizontal cluster scale
+	// in. When enabled, nodes running allocations that match the configured
+	// protection rules are refused before any drain is triggered. It defaults
+	// to false, which preserves the historical candidate behaviour.
+	TargetConfigKeyNodeProtectAllocations = "node_protect_allocations"
+
+	// TargetConfigKeyNodeProtectSystemJobs is the config key which defines
+	// whether non-terminal system job allocations protect a node from scale
+	// in. It defaults to false because system jobs run on every node and
+	// protecting on them would block all scale in activity.
+	TargetConfigKeyNodeProtectSystemJobs = "node_protect_system_jobs"
+
+	// TargetConfigKeyNodeProtectMigrating is the config key which defines
+	// whether allocations marked for migration by the Nomad scheduler
+	// (DesiredTransition.Migrate) protect a node from scale in. It defaults
+	// to true when allocation protection is enabled.
+	TargetConfigKeyNodeProtectMigrating = "node_protect_migrating"
+
+	// TargetConfigKeyNodeProtectAll is the config key which defines whether
+	// any non-terminal allocation protects a node from scale in. It defaults
+	// to false.
+	TargetConfigKeyNodeProtectAll = "node_protect_all_allocations"
+
+	// TargetConfigKeyNodeProtectJobs is the config key which lists job IDs,
+	// comma separated, whose non-terminal allocations always protect a node
+	// from scale in.
+	TargetConfigKeyNodeProtectJobs = "node_protect_jobs"
+
+	// TargetConfigKeyScaleInShortfall is the config key which defines the
+	// behaviour when protection filtering leaves fewer candidates than the
+	// requested scale in count. Supported values are "partial" (scale in
+	// fewer nodes, the default) and "fail" (abort the whole action with an
+	// error).
+	TargetConfigKeyScaleInShortfall = "node_scale_in_shortfall"
+
+	// TargetConfigKeyScaleInPartialFailure is the config key which defines
+	// the behaviour when some, but not all, selected nodes fail to drain.
+	// Supported values are "terminate_successes" (terminate the confirmed
+	// subset, the default) and "abort" (terminate nothing and return an
+	// error).
+	TargetConfigKeyScaleInPartialFailure = "node_scale_in_partial_failure"
+
 	// TargetConfigNodeSelectorStrategy is the optional node target config
 	// option which dictates how the Nomad Autoscaler selects nodes when
 	// scaling in.

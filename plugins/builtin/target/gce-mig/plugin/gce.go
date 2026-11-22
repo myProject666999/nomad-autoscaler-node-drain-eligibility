@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/hashicorp/nomad-autoscaler/sdk"
+	"github.com/hashicorp/nomad-autoscaler/sdk/helper/scaleutils"
 	"github.com/hashicorp/nomad/api"
 	"github.com/mitchellh/go-homedir"
 	"google.golang.org/api/compute/v1"
@@ -117,9 +119,25 @@ func (t *TargetPlugin) scaleIn(ctx context.Context, group instanceGroup, num int
 		}
 	}
 
-	ids, err := t.clusterUtils.RunPreScaleInTasksWithRemoteCheck(ctx, config, remoteIDs, int(num))
+	scaleInResult, err := t.clusterUtils.RunPreScaleInTasksWithRemoteCheckDetailed(ctx, config, remoteIDs, int(num))
 	if err != nil {
 		return fmt.Errorf("failed to perform pre-scale Nomad scale in tasks: %v", err)
+	}
+	for _, r := range scaleInResult.NodeResults {
+		if r.Status == scaleutils.NodeDrainStatusDrained {
+			continue
+		}
+		log.Warn("node excluded from scale in termination",
+			"node_id", r.NomadNodeID, "remote_id", r.RemoteResourceID,
+			"stage", r.Stage, "status", r.Status, "reason", r.Reason, "error", r.Err)
+	}
+
+	// Only nodes confirmed safe by the pre-scale tasks may be deleted; the
+	// candidate list is never used as deletion authorisation.
+	ids := scaleInResult.Terminate
+	if len(ids) == 0 {
+		return sdk.NewTargetScalingNoOpError("no Nomad nodes confirmed safe to delete in instance group %s",
+			group.getName())
 	}
 
 	// Grab the instanceIDs
